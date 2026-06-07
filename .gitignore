@@ -1,0 +1,29 @@
+.DS_Store
+venv/
+.venv/
+test/
+.idea/
+
+log/*
+!log/.gitkeep
+data/*
+!data/.gitkeep
+# local sqlite database
+data/data.db
+
+conf/.env
+
+# feishu-relay
+feishu-relay/.env
+feishu-relay/config/git_user_to_name.json
+feishu-relay/config/feishu_open_ids.json
+*.pyc
+__pycache__/
+feishu-relay/.venv/
+feishu-relay/venv/
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+
+# mypy cache
+.mypy_cache/

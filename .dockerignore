@@ -1,0 +1,12 @@
+.venv
+data
+log
+.git
+frontend/node_modules
+frontend/dist
+__pycache__
+*.pyc
+.mypy_cache
+conf/.env
+feishu-relay/.env
+tests

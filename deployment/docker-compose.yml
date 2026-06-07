@@ -1,0 +1,41 @@
+services:
+  code-reviewer:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    image: code-reviewer:latest
+    container_name: code-reviewer
+    ports:
+      - "25001:5001"
+    volumes:
+      - ../data:/app/data
+      - ../log:/app/log
+    env_file:
+      - ../conf/.env
+    environment:
+      - EXTRA_WEBHOOK_URL=http://feishu-relay:8090/notify
+    depends_on:
+      - feishu-relay
+    restart: unless-stopped
+    networks:
+      - code-reviewer-net
+
+  feishu-relay:
+    build:
+      context: ../feishu-relay
+      dockerfile: Dockerfile
+    image: feishu-relay:latest
+    container_name: feishu-relay
+    ports:
+      - "8090:8090"
+    env_file:
+      - ../feishu-relay/.env
+    volumes:
+      - ../feishu-relay/config:/app/config:ro
+    restart: unless-stopped
+    networks:
+      - code-reviewer-net
+
+networks:
+  code-reviewer-net:
+    driver: bridge

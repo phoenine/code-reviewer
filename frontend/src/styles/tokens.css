@@ -1,0 +1,21 @@
+:root {
+  --bg-page: #0f1726;
+  --bg-sidebar: #192535;
+  --bg-card: #162a47;
+  --bg-card-soft: #0f2341;
+  --border-card: #1e3452;
+  --divider: #2d4a6e;
+  --text-primary: #e8edf5;
+  --text-secondary: #7b93b5;
+  --text-muted: #4a6a8a;
+  --accent-green: #10b981;
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --blue: #3b82f6;
+  --purple: #8b5cf6;
+  --sidebar-width: 236px;
+  --radius-card: 14px;
+  --card-padding: 24px;
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
