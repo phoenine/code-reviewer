@@ -5,8 +5,7 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir fastapi==0.116.1 uvicorn==0.35.0 requests==2.32.5 python-dotenv==1.1.1
 
 COPY app ./app
 COPY config ./config
