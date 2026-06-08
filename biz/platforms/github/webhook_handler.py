@@ -1,14 +1,16 @@
+import base64
+import binascii
 import os
-import re
 import time
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 import fnmatch
+from biz.diff.filter import filter_diffs
+from biz.diff.parser import parse_changes
 from biz.utils.log import logger
 
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "10"))
-DEFAULT_SUPPORTED_EXTENSIONS = ".java,.py,.ts,.tsx,.js,.html,.scss,.sql,.yaml,.yml,.sh,.go,.json"
 
 
 def _get_github_api_base_url(github_url: str) -> str:
@@ -28,57 +30,63 @@ def _get_github_api_base_url(github_url: str) -> str:
     return f"{scheme}://{host}/api/v3"
 
 
-def filter_changes(changes: list):
-    """
-    Filter changes, keeping only supported file types and necessary fields.
-    Handles GitHub-specific change format.
-    """
-    # Read supported file extensions from env
-    supported_extensions = os.getenv(
-        "SUPPORTED_EXTENSIONS", DEFAULT_SUPPORTED_EXTENSIONS
-    ).split(",")
+def _get_repository_file_content(
+    api_base_url: str, repo_full_name: str | None, github_token: str, path: str, ref: str
+) -> str | None:
+    if not repo_full_name or not path or not ref:
+        return None
 
-    # Filter out deleted files
-    not_deleted_changes = []
-    for change in changes:
-        # Check status field first for 'removed'
-        if change.get("status") == "removed":
-            logger.info(
-                f"Detected file deletion via status field: {change.get('new_path')}"
+    encoded_path = quote(path, safe="/")
+    url = f"{api_base_url}/repos/{repo_full_name}/contents/{encoded_path}"
+    headers = {
+        "Authorization": f"token {github_token}",
+        "Accept": "application/vnd.github.raw",
+    }
+    response = requests.get(
+        url, headers=headers, params={"ref": ref}, timeout=HTTP_TIMEOUT_SECONDS
+    )
+    logger.debug(
+        "Get file content from GitHub: %s, URL: %s, path: %s, ref: %s",
+        response.status_code,
+        url,
+        path,
+        ref,
+    )
+    if response.status_code != 200:
+        logger.warning(
+            "Failed to get file content from GitHub: %s, %s, path=%s, ref=%s",
+            response.status_code,
+            response.text,
+            path,
+            ref,
+        )
+        return None
+
+    content_type = response.headers.get("Content-Type", "")
+    if "application/json" not in content_type:
+        return response.content.decode("utf-8", errors="replace")
+
+    try:
+        data = response.json()
+    except ValueError:
+        return response.content.decode("utf-8", errors="replace")
+    if isinstance(data, dict) and "content" in data:
+        encoded_content = data.get("content")
+        if not encoded_content or not str(encoded_content).strip():
+            return None
+        try:
+            return base64.b64decode(encoded_content).decode("utf-8", errors="replace")
+        except (binascii.Error, ValueError) as exc:
+            logger.warning(
+                "Failed to decode GitHub file content: %s, path=%s", exc, path
             )
-            continue
+            return None
+    return response.content.decode("utf-8", errors="replace")
 
-        # Fallback: inspect diff pattern for deletion
-        diff = change.get("diff", "")
-        if diff:
-            diff_header_match = re.match(r"@@ -\d+,\d+ \+0,0 @@", diff)
-            if diff_header_match:
-                # Check if all lines (except header) start with '-'
-                diff_lines = diff.split("\n")[1:]  # Skip diff header line
-                if all(line.startswith("-") or not line for line in diff_lines):
-                    logger.info(
-                        f"Detected file deletion via diff pattern: {change.get('new_path')}"
-                    )
-                    continue
 
-        not_deleted_changes.append(change)
-
-    logger.info(f"SUPPORTED_EXTENSIONS: {supported_extensions}")
-    logger.info(f"After filtering deleted files: {not_deleted_changes}")
-
-    # Filter: keep only diff and new_path for supported extensions
-    filtered_changes = [
-        {
-            "diff": item.get("diff", ""),
-            "new_path": item["new_path"],
-            "additions": item.get("additions", 0),
-            "deletions": item.get("deletions", 0),
-        }
-        for item in not_deleted_changes
-        if any(item.get("new_path", "").endswith(ext) for ext in supported_extensions)
-    ]
-    logger.info(f"After filtering by extension: {filtered_changes}")
-    return filtered_changes
+def filter_changes(changes: list):
+    """Filter changes, delegating to the structured diff pipeline"""
+    return filter_diffs(parse_changes(changes, source="github"))
 
 
 class PullRequestHandler:
@@ -94,12 +102,10 @@ class PullRequestHandler:
         self.parse_event_type()
 
     def parse_event_type(self):
-        # Extract event_type from webhook data
-        self.event_type = "pull_request"  # Event type already resolved from X-GitHub-Event header
+        self.event_type = "pull_request"
         self.parse_pull_request_event()
 
     def parse_pull_request_event(self):
-        # Extract pull request fields
         self.pull_request_number = self.webhook_data.get("pull_request", {}).get(
             "number"
         )
@@ -107,18 +113,15 @@ class PullRequestHandler:
         self.action = self.webhook_data.get("action")
 
     def get_pull_request_changes(self) -> list:
-        # Verify this is a pull request event
         if self.event_type != "pull_request":
             logger.warning(
                 f"Invalid event type: {self.event_type}. Only 'pull_request' event is supported now."
             )
             return []
 
-        # GitHub PR changes API may lag; retry with backoff
-        max_retries = 3  # Max retry attempts
-        retry_delay = 10  # Delay between retries (seconds)
+        max_retries = 3
+        retry_delay = 10
         for attempt in range(max_retries):
-            # Fetch PR changed files from GitHub API
             url = f"{self.api_base_url}/repos/{self.repo_full_name}/pulls/{self.pull_request_number}/files"
             headers = {
                 "Authorization": f"token {self.github_token}",
@@ -129,17 +132,20 @@ class PullRequestHandler:
                 f"Get changes response from GitHub (attempt {attempt + 1}): {response.status_code}, {response.text}, URL: {url}"
             )
 
-            # Check if request succeeded
             if response.status_code == 200:
                 files = response.json()
                 if files:
-                    # Convert to GitLab-compatible changes format
                     changes = []
                     for file in files:
                         change = {
                             "old_path": file.get("filename"),
                             "new_path": file.get("filename"),
                             "diff": file.get("patch", ""),
+                            "filename": file.get("filename"),
+                            "previous_filename": file.get("previous_filename"),
+                            "patch": file.get("patch", ""),
+                            "status": file.get("status", ""),
+                            "sha": file.get("sha", ""),
                             "additions": file.get("additions", 0),
                             "deletions": file.get("deletions", 0),
                         }
@@ -147,7 +153,8 @@ class PullRequestHandler:
                     return changes
                 else:
                     logger.info(
-                        f"Changes is empty, retrying in {retry_delay} seconds... (attempt {attempt + 1}/{max_retries}), URL: {url}"
+                        f"Changes is empty, retrying in {retry_delay} seconds... "
+                        f"(attempt {attempt + 1}/{max_retries}), URL: {url}"
                     )
                     time.sleep(retry_delay)
             else:
@@ -157,14 +164,12 @@ class PullRequestHandler:
                 return []
 
         logger.warning(f"Max retries ({max_retries}) reached. Changes is still empty.")
-        return []  # All retries exhausted
+        return []
 
     def get_pull_request_commits(self) -> list:
-        # Verify this is a pull request event
         if self.event_type != "pull_request":
             return []
 
-        # Fetch PR commits from GitHub API
         url = f"{self.api_base_url}/repos/{self.repo_full_name}/pulls/{self.pull_request_number}/commits"
         headers = {
             "Authorization": f"token {self.github_token}",
@@ -175,9 +180,7 @@ class PullRequestHandler:
             f"Get commits response from GitHub: {response.status_code}, {response.text}"
         )
 
-        # Check if request succeeded
         if response.status_code == 200:
-            # Convert GitHub commits to GitLab-compatible format
             github_commits = response.json()
             gitlab_format_commits = []
             for commit in github_commits:
@@ -223,6 +226,15 @@ class PullRequestHandler:
             logger.error(f"Failed to add comment: {response.status_code}")
             logger.error(response.text)
 
+    def get_file_content(self, path: str, ref: str) -> str | None:
+        return _get_repository_file_content(
+            self.api_base_url,
+            self.repo_full_name,
+            self.github_token,
+            path,
+            ref,
+        )
+
     def target_branch_protected(self) -> bool:
         url = f"{self.api_base_url}/repos/{self.repo_full_name}/branches?protected=true"
         headers = {
@@ -255,25 +267,21 @@ class PushHandler:
         self.parse_event_type()
 
     def parse_event_type(self):
-        # Extract event_type from webhook data
-        self.event_type = "push"  # Event type already resolved from X-GitHub-Event header
+        self.event_type = "push"
         self.parse_push_event()
 
     def parse_push_event(self):
-        # Extract push event fields
         self.repo_full_name = self.webhook_data.get("repository", {}).get("full_name")
         self.branch_name = self.webhook_data.get("ref", "").replace("refs/heads/", "")
         self.commit_list = self.webhook_data.get("commits", [])
 
     def get_push_commits(self) -> list:
-        # Verify this is a push event
         if self.event_type != "push":
             logger.warning(
                 f"Invalid event type: {self.event_type}. Only 'push' event is supported now."
             )
             return []
 
-        # Extract commit details
         commit_details = []
         for commit in self.commit_list:
             commit_info = {
@@ -288,12 +296,10 @@ class PushHandler:
         return commit_details
 
     def add_push_notes(self, message: str):
-        # Add comment to the last push commit
         if not self.commit_list:
             logger.warning("No commits found to add notes to.")
             return
 
-        # Get the last commit ID
         last_commit_id = self.commit_list[-1].get("id")
         if not last_commit_id:
             logger.error("Last commit ID not found.")
@@ -317,8 +323,16 @@ class PushHandler:
             logger.error(f"Failed to add comment: {response.status_code}")
             logger.error(response.text)
 
+    def get_file_content(self, path: str, ref: str) -> str | None:
+        return _get_repository_file_content(
+            self.api_base_url,
+            self.repo_full_name,
+            self.github_token,
+            path,
+            ref,
+        )
+
     def __repository_commits(self, sha: str = "", per_page: int = 100, page: int = 1):
-        # Fetch repository commits
         url = f"{self.api_base_url}/repos/{self.repo_full_name}/commits?sha={sha}&per_page={per_page}&page={page}"
         headers = {
             "Authorization": f"token {self.github_token}",
@@ -353,8 +367,7 @@ class PushHandler:
         return ""
 
     def repository_compare(self, base: str, head: str):
-        # Compare two commits
-        url = f"{urljoin(f'{self.github_url}/', f'repos/{self.repo_full_name}/compare/{base}...{head}')}"
+        url = f"{self.api_base_url}/repos/{self.repo_full_name}/compare/{base}...{head}"
         headers = {
             "Authorization": f"token {self.github_token}",
             "Accept": "application/vnd.github.v3+json",
@@ -365,7 +378,6 @@ class PushHandler:
         )
 
         if response.status_code == 200:
-            # Convert GitHub diff to GitLab-compatible format
             files = response.json().get("files", [])
             diffs = []
             for file in files:
@@ -386,37 +398,30 @@ class PushHandler:
             return []
 
     def get_push_changes(self) -> list:
-        # Verify this is a push event
         if self.event_type != "push":
             logger.warning(
                 f"Invalid event type: {self.event_type}. Only 'push' event is supported now."
             )
             return []
 
-        # No commits, return empty
         if not self.commit_list:
             logger.info("No commits found in push event.")
             return []
 
-        # Prefer compare API for changes
         before = self.webhook_data.get("before", "")
         after = self.webhook_data.get("after", "")
         if before and after:
-            # GitHub doesn't use 0000000; check for branch create/delete instead
             if self.webhook_data.get("created", False):
-                # Branch creation
                 first_commit_id = self.commit_list[0].get("id")
                 if first_commit_id:
                     parent_commit_id = self.get_parent_commit_id(first_commit_id)
                     if parent_commit_id:
                         before = parent_commit_id
             elif self.webhook_data.get("deleted", False):
-                # Branch deletion — skip
                 return []
 
             return self.repository_compare(before, after)
         else:
-            # Fallback: fetch via commits when before/after unavailable
             logger.info(
                 "before or after not found in webhook data, trying to get changes from commits."
             )

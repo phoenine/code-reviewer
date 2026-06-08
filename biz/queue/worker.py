@@ -4,6 +4,7 @@ from datetime import datetime
 
 from biz.entity.review_entity import MergeRequestReviewEntity, PushReviewEntity
 from biz.event.event_manager import event_manager
+from biz.context.window import build_review_context
 from biz.platforms.gitlab.webhook_handler import (
     filter_changes,
     MergeRequestHandler,
@@ -14,10 +15,13 @@ from biz.platforms.github.webhook_handler import (
     PullRequestHandler as GithubPullRequestHandler,
     PushHandler as GithubPushHandler,
 )
+from biz.model.diff import Diff
+from biz.model.review_context import ReviewContext
 from biz.service.review_service import ReviewService
 from biz.utils.code_reviewer import CodeReviewer
 from biz.utils.im import notifier
 from biz.utils.log import logger
+from biz.utils.review_renderer import render_review_markdown
 
 
 def _safe_commit_message(commit: dict) -> str:
@@ -28,12 +32,12 @@ def _build_commits_text(commits: list[dict]) -> str:
     return ";".join(_safe_commit_message(commit) for commit in commits)
 
 
-def _count_change_stats(changes: list[dict]) -> tuple[int, int]:
+def _count_change_stats(changes: list[Diff]) -> tuple[int, int]:
     additions = 0
     deletions = 0
     for item in changes:
-        additions += item.get("additions", 0)
-        deletions += item.get("deletions", 0)
+        additions += item.additions
+        deletions += item.deletions
     return additions, deletions
 
 
@@ -51,14 +55,30 @@ def _github_project_context(webhook_data: dict) -> dict:
     }
 
 
+def _build_context(
+    handler, changes: list[Diff], ref: str | None
+) -> ReviewContext | None:
+    if not ref or not hasattr(handler, "get_file_content"):
+        return None
+    try:
+        return build_review_context(changes, ref, handler.get_file_content)
+    except Exception as e:
+        logger.warning(
+            "Failed to build review context, falling back to diff-only review: %s", e
+        )
+        return None
+
+
 def _review_changes(
-    changes: list[dict], commits: list[dict], project_context: dict | None = None
+    changes: list[Diff],
+    commits: list[dict],
+    project_context: dict | None = None,
+    review_context: ReviewContext | None = None,
 ) -> tuple[str, int | None]:
-    review_result = CodeReviewer(project_context).review_and_strip_code(
-        str(changes), _build_commits_text(commits)
+    review_result = CodeReviewer(project_context).review_diffs(
+        changes, _build_commits_text(commits), review_context
     )
-    score = CodeReviewer.parse_review_score(review_text=review_result)
-    return review_result, score
+    return render_review_markdown(review_result), review_result.score
 
 
 def handle_push_event(
@@ -78,7 +98,6 @@ def handle_push_event(
         additions = 0
         deletions = 0
         if push_review_enabled:
-            # Fetch push changes
             changes = handler.get_push_changes()
             logger.info("changes: %s", changes)
             changes = filter_changes(changes)
@@ -89,8 +108,14 @@ def handle_push_event(
             review_result = "No changes in tracked files"
 
             if len(changes) > 0:
+                review_context = _build_context(
+                    handler, changes, webhook_data.get("after")
+                )
                 review_result, score = _review_changes(
-                    changes, commits, _gitlab_project_context(webhook_data)
+                    changes,
+                    commits,
+                    _gitlab_project_context(webhook_data),
+                    review_context,
                 )
                 additions, deletions = _count_change_stats(changes)
             # Post review result as GitLab note
@@ -123,32 +148,30 @@ def handle_merge_request_event(
 ):
     """
     Handle GitLab Merge Request Hook event
-    :param webhook_data:
-    :param gitlab_token:
-    :param gitlab_url:
-    :param gitlab_url_slug:
-    :return:
     """
     merge_review_only_protected_branches = (
         os.environ.get("MERGE_REVIEW_ONLY_PROTECTED_BRANCHES_ENABLED", "0") == "1"
     )
     try:
-        # Parse webhook data
         handler = MergeRequestHandler(webhook_data, gitlab_token, gitlab_url)
         logger.info("Merge Request Hook event received")
 
-        # Check if MR is a draft
         object_attributes = webhook_data.get("object_attributes", {})
         is_draft = object_attributes.get("draft") or object_attributes.get(
             "work_in_progress"
         )
         if is_draft:
-            msg = f"[Notice] MR is draft, AI review skipped.\\nProject: {webhook_data['project']['name']}\\nAuthor: {webhook_data['user']['username']}\\nSource Branch: {object_attributes.get('source_branch')}\\nTarget Branch: {object_attributes.get('target_branch')}"
+            msg = (
+                f"[Notice] MR is draft, AI review skipped.\n"
+                f"Project: {webhook_data['project']['name']}\n"
+                f"Author: {webhook_data['user']['username']}\n"
+                f"Source Branch: {object_attributes.get('source_branch')}\n"
+                f"Target Branch: {object_attributes.get('target_branch')}"
+            )
             notifier.send_notification(content=msg)
             logger.info("MR is draft, sending notification only, skipping AI review.")
             return
 
-        # If review-only-protected-branches is on, check target branch
         if (
             merge_review_only_protected_branches
             and not handler.target_branch_protected()
@@ -162,7 +185,6 @@ def handle_merge_request_event(
             logger.info(f"Merge Request Hook event, action={handler.action}, ignored.")
             return
 
-        # Skip if last_commit_id already processed
         last_commit_id = object_attributes.get("last_commit", {}).get("id", "")
         if last_commit_id:
             project_name = webhook_data["project"]["name"]
@@ -173,12 +195,11 @@ def handle_merge_request_event(
                 project_name, source_branch, target_branch, last_commit_id
             ):
                 logger.info(
-                    f"Merge Request with last_commit_id {last_commit_id} already exists, skipping review for {project_name}."
+                    f"Merge Request with last_commit_id {last_commit_id} already exists, "
+                    f"skipping review for {project_name}."
                 )
                 return
 
-        # Only review on MR open/update
-        # Fetch MR changes
         changes = handler.get_merge_request_changes()
         logger.info("changes: %s", changes)
         changes = filter_changes(changes)
@@ -187,24 +208,20 @@ def handle_merge_request_event(
                 "No code changes detected in supported file types."
             )
             return
-        # Count additions and deletions
         additions, deletions = _count_change_stats(changes)
 
-        # Fetch MR commits
         commits = handler.get_merge_request_commits()
         if not commits:
             logger.error("Failed to get commits")
             return
 
-        # Run code review
+        review_context = _build_context(handler, changes, last_commit_id)
         review_result, score = _review_changes(
-            changes, commits, _gitlab_project_context(webhook_data)
+            changes, commits, _gitlab_project_context(webhook_data), review_context
         )
 
-        # Post review result as GitLab note
         handler.add_merge_request_notes(f"Auto Review Result: \n{review_result}")
 
-        # dispatch merge_request_reviewed event
         event_manager["merge_request_reviewed"].send(
             MergeRequestReviewEntity(
                 project_name=webhook_data["project"]["name"],
@@ -249,7 +266,6 @@ def handle_github_push_event(
         additions = 0
         deletions = 0
         if push_review_enabled:
-            # Fetch push changes
             changes = handler.get_push_changes()
             logger.info("changes: %s", changes)
             changes = filter_github_changes(changes)
@@ -260,11 +276,16 @@ def handle_github_push_event(
             review_result = "No changes in tracked files"
 
             if len(changes) > 0:
+                review_context = _build_context(
+                    handler, changes, webhook_data.get("after")
+                )
                 review_result, score = _review_changes(
-                    changes, commits, _github_project_context(webhook_data)
+                    changes,
+                    commits,
+                    _github_project_context(webhook_data),
+                    review_context,
                 )
                 additions, deletions = _count_change_stats(changes)
-            # Post review result as GitHub PR note
             handler.add_push_notes(f"Auto Review Result: \n{review_result}")
 
         event_manager["push_reviewed"].send(
@@ -294,20 +315,13 @@ def handle_github_pull_request_event(
 ):
     """
     Handle GitHub Pull Request event
-    :param webhook_data:
-    :param github_token:
-    :param github_url:
-    :param github_url_slug:
-    :return:
     """
     merge_review_only_protected_branches = (
         os.environ.get("MERGE_REVIEW_ONLY_PROTECTED_BRANCHES_ENABLED", "0") == "1"
     )
     try:
-        # Parse webhook data
         handler = GithubPullRequestHandler(webhook_data, github_token, github_url)
         logger.info("GitHub Pull Request event received")
-        # If review-only-protected-branches is on, check target branch
         if (
             merge_review_only_protected_branches
             and not handler.target_branch_protected()
@@ -321,7 +335,6 @@ def handle_github_pull_request_event(
             logger.info(f"Pull Request Hook event, action={handler.action}, ignored.")
             return
 
-        # Skip if last_commit_id already processed (GitHub PR)
         github_last_commit_id = webhook_data["pull_request"]["head"]["sha"]
         if github_last_commit_id:
             project_name = webhook_data["repository"]["name"]
@@ -332,12 +345,11 @@ def handle_github_pull_request_event(
                 project_name, source_branch, target_branch, github_last_commit_id
             ):
                 logger.info(
-                    f"Pull Request with last_commit_id {github_last_commit_id} already exists, skipping review for {project_name}."
+                    f"Pull Request with last_commit_id {github_last_commit_id} already exists, "
+                    f"skipping review for {project_name}."
                 )
                 return
 
-        # Only review on PR open/update
-        # Fetch PR changes
         changes = handler.get_pull_request_changes()
         logger.info("changes: %s", changes)
         changes = filter_github_changes(changes)
@@ -346,24 +358,20 @@ def handle_github_pull_request_event(
                 "No code changes detected in supported file types."
             )
             return
-        # Count additions and deletions
         additions, deletions = _count_change_stats(changes)
 
-        # Fetch PR commits
         commits = handler.get_pull_request_commits()
         if not commits:
             logger.error("Failed to get commits")
             return
 
-        # Run code review
+        review_context = _build_context(handler, changes, github_last_commit_id)
         review_result, score = _review_changes(
-            changes, commits, _github_project_context(webhook_data)
+            changes, commits, _github_project_context(webhook_data), review_context
         )
 
-        # Post review result as GitHub PR note
         handler.add_pull_request_notes(f"Auto Review Result: \n{review_result}")
 
-        # dispatch pull_request_reviewed event
         event_manager["merge_request_reviewed"].send(
             MergeRequestReviewEntity(
                 project_name=webhook_data["repository"]["name"],
