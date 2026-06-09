@@ -7,8 +7,11 @@ type TimePeriod = 'week' | 'two_weeks' | 'month' | 'custom';
 function periodToTimestamps(period: TimePeriod): { start?: number; end?: number } {
   if (period === 'custom') return {};
   const now = Math.floor(Date.now() / 1000);
-  const days = period === 'week' ? 7 : period === 'two_weeks' ? 14 : 30;
-  return { start: now - days * 86400, end: now };
+  return { start: now - periodDays(period) * 86400, end: now };
+}
+
+function periodDays(period: TimePeriod): number {
+  return period === 'week' ? 7 : period === 'two_weeks' ? 14 : period === 'month' ? 30 : 0;
 }
 
 function periodLabel(period: TimePeriod): string {
@@ -168,12 +171,13 @@ function MembersPage() {
   const ts = periodToTimestamps(period);
   const { data, error } = useAsync(() => fetchMembers(ts.start, ts.end), [period]);
   const members = data ?? emptyMembers;
-  return <><Header current="Members" right={<TimeSegments active={period} onChange={setPeriod} />} />{error && <div className="error">{error}</div>}{members.items.length === 0 ? <Empty text="No member data available" /> : <MemberGrid items={members.items} />}<TeamSummary data={members} /></>;
+  return <><Header current="Members" right={<TimeSegments active={period} onChange={setPeriod} />} />{error && <div className="error">{error}</div>}{members.items.length === 0 ? <Empty text="No member data available" /> : <MemberGrid items={members.items} period={period} />}<TeamSummary data={members} /></>;
 }
 
-function MemberGrid({ items }: { items: MemberItem[] }) {
+function MemberGrid({ items, period }: { items: MemberItem[]; period: TimePeriod }) {
   const colors = ['#3B82F6', '#F59E0B', '#22C55E', '#8B5CF6', '#EC4899', '#06B6D4', '#F97316', '#64748B'];
-  return <div className="member-grid">{items.map((item, index) => <section className="card member-card" key={item.author}><div className="member-top"><div className="avatar" style={{ background: colors[index % colors.length] }}>{item.author.slice(0, 1).toUpperCase()}</div><div className="member-name">{item.author}</div></div><div className="card-divider" /><div className="member-stats"><MiniStat label="Commits" value={item.review_count} color="#3B82F6" /><MiniStat label="Daily Avg" value={Math.round((item.review_count / 7) * 10) / 10} color="#F59E0B" /><MiniStat label="Avg Score" value={item.average_score} color="#22C55E" /></div></section>)}</div>;
+  const days = periodDays(period);
+  return <div className="member-grid">{items.map((item, index) => <section className="card member-card" key={item.author}><div className="member-top"><div className="avatar" style={{ background: colors[index % colors.length] }}>{item.author.slice(0, 1).toUpperCase()}</div><div className="member-name">{item.author}</div></div><div className="card-divider" /><div className="member-stats"><MiniStat label="Commits" value={item.review_count} color="#3B82F6" /><MiniStat label="Daily Avg" value={days > 0 ? Math.round((item.review_count / days) * 10) / 10 : '-'} color="#F59E0B" /><MiniStat label="Avg Score" value={item.average_score} color="#22C55E" /></div></section>)}</div>;
 }
 
 function MiniStat({ label, value, color }: { label: string; value: string | number; color: string }) { return <div className="mini-stat"><strong style={{ color }}>{value}</strong><span>{label}</span></div>; }

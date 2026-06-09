@@ -19,7 +19,14 @@ from biz.utils.review_result_parser import parse_review_result
 from biz.utils.token_util import count_tokens, truncate_text_by_tokens
 
 
-ALLOWED_REVIEW_STYLES = {"professional", "concise", "strict"}
+ALLOWED_REVIEW_STYLES = {
+    "professional",
+    "concise",
+    "strict",
+    "sarcastic",
+    "gentle",
+    "humorous",
+}
 
 
 class BaseReviewer(abc.ABC):

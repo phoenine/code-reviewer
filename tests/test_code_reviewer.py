@@ -71,6 +71,7 @@ class CodeReviewerTest(unittest.TestCase):
             BaseReviewer._normalize_review_style("{{ unsafe }}"), "professional"
         )
         self.assertEqual(BaseReviewer._normalize_review_style("strict"), "strict")
+        self.assertEqual(BaseReviewer._normalize_review_style("sarcastic"), "sarcastic")
 
 
 if __name__ == "__main__":
