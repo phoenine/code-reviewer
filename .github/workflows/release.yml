@@ -5,23 +5,67 @@ on:
     tags:
       - 'v*.*.*'
 
+# 最小权限：仅创建 Release + 推送容器镜像
+permissions:
+  contents: write
+  packages: write
+
 jobs:
   release:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      packages: write
-
     steps:
       - uses: actions/checkout@v4
 
+      # 1. 先校验所有 Dockerfile 存在，避免构建到一半才报错
+      - name: Verify Dockerfiles
+        run: |
+          for f in deployment/Dockerfile feishu-relay/Dockerfile; do
+            test -f "$f" && echo "OK: $f" || { echo "MISSING: $f"; exit 1; }
+          done
+
+      # 2. 创建 GitHub Release（含自动生成 Release Notes）
       - name: Create GitHub Release
-        id: create_release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           name: Release ${{ github.ref_name }}
-          discussion_category: announcements
+
+      # 3. 登录容器仓库
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 4. 设置 Buildx
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+  # 5. 用矩阵并行构建多个 Docker 镜像，消除重复步骤
+  docker:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - name: code-reviewer
+            context: .
+            dockerfile: deployment/Dockerfile
+          - name: feishu-relay
+            context: ./feishu-relay
+            dockerfile: ./feishu-relay/Dockerfile
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Dockerfile exists
+        run: |
+          test -f "${{ matrix.dockerfile }}" \
+            && echo "OK: ${{ matrix.dockerfile }}" \
+            || { echo "MISSING: ${{ matrix.dockerfile }}"; exit 1; }
 
       - name: Log in to Container Registry
         uses: docker/login-action@v3
@@ -33,22 +77,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push code-reviewer image
+      - name: Build and push ${{ matrix.name }}
         uses: docker/build-push-action@v5
         with:
-          context: .
-          file: deployment/Dockerfile
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}/code-reviewer:${{ github.ref_name }}
-            ghcr.io/${{ github.repository }}/code-reviewer:latest
-
-      - name: Build and push feishu-relay image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./feishu-relay
-          file: ./feishu-relay/Dockerfile
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository }}/feishu-relay:${{ github.ref_name }}
-            ghcr.io/${{ github.repository }}/feishu-relay:latest
+            ghcr.io/${{ github.repository }}/${{ matrix.name }}:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}/${{ matrix.name }}:latest
