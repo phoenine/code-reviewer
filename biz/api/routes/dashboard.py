@@ -192,23 +192,25 @@ def summary():
     valid_scores = _valid_scores(combined) if not combined.empty else pd.Series(dtype=float)
     current_score = round(float(valid_scores.mean()), 2) if not valid_scores.empty else 0.0
     
-    # previous period score filtering
-    prev_valid_scores: pd.Series | None = None
-    prev_score_val = 0.0
-
     # --- previous period comparison ---
     start_ts = _parse_int(request.args.get("start"))
     end_ts = _parse_int(request.args.get("end"))
     previous = None
     if start_ts is not None and end_ts is not None:
+        authors = _parse_multi(request.args.get("author"))
+        project_names = _parse_multi(request.args.get("project_name"))
         period_len = end_ts - start_ts
         prev_end = start_ts - 1
         prev_start = prev_end - period_len
         prev_mr = ReviewService.get_mr_review_logs(
+            authors=authors,
+            project_names=project_names,
             updated_at_gte=prev_start,
             updated_at_lte=prev_end,
         )
         prev_push = ReviewService.get_push_review_logs(
+            authors=authors,
+            project_names=project_names,
             updated_at_gte=prev_start,
             updated_at_lte=prev_end,
         )
@@ -219,12 +221,11 @@ def summary():
         if not prev_combined.empty:
             prev_valid = _valid_scores(prev_combined)
             prev_total = int(len(prev_combined))
-            prev_score_val = round(float(prev_valid.mean()), 2) if not prev_valid.empty else 0.0
             prev_projects = int(prev_combined["project_name"].nunique())
             prev_members = int(prev_combined["author"].nunique())
             previous = {
                 "total_reviews": prev_total,
-                "average_score": prev_score_val,
+                "average_score": round(float(prev_valid.mean()), 2) if not prev_valid.empty else 0.0,
                 "active_projects": prev_projects,
                 "active_members": prev_members,
             }

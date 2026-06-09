@@ -75,6 +75,53 @@ class DashboardApiTest(unittest.TestCase):
         self.assertEqual(data["recent_reviews"][0]["type"], "push")
         self.assertEqual(data["recent_reviews"][0]["project_name"], "beta")
 
+    def test_summary_previous_period_keeps_author_and_project_filters(self):
+        ReviewService.insert_mr_review_log(
+            MergeRequestReviewEntity(
+                project_name="alpha",
+                author="yangfan",
+                source_branch="feature/previous",
+                target_branch="main",
+                updated_at=1699999900,
+                commits=[{"message": "previous matching review"}],
+                score=90,
+                url="http://gitlab.local/alpha/-/merge_requests/0",
+                review_result="Previous matching result",
+                url_slug="alpha!0",
+                webhook_data={},
+                additions=10,
+                deletions=1,
+                last_commit_id="commit-previous-match",
+            )
+        )
+        ReviewService.insert_push_review_log(
+            PushReviewEntity(
+                project_name="beta",
+                author="lisa",
+                branch="develop",
+                updated_at=1699999900,
+                commits=[{"message": "previous unrelated review"}],
+                score=70,
+                review_result="Previous unrelated result",
+                url_slug="beta@develop",
+                webhook_data={},
+                additions=5,
+                deletions=2,
+            )
+        )
+
+        response = self.client.get(
+            "/api/dashboard/summary"
+            "?author=yangfan&project_name=alpha&start=1700000000&end=1700000200"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["total_reviews"], 1)
+        self.assertEqual(data["previous"]["total_reviews"], 1)
+        self.assertEqual(data["previous"]["active_projects"], 1)
+        self.assertEqual(data["previous"]["active_members"], 1)
+
     def test_reviews_support_type_filter_keyword_and_pagination(self):
         response = self.client.get(
             "/api/dashboard/reviews?type=mr&keyword=dashboard&page=1&page_size=10"

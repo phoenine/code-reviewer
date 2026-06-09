@@ -92,6 +92,9 @@ def handle_push_event(
         if not commits:
             logger.error("Failed to get commits")
             return
+        if not push_review_enabled:
+            logger.info("Push review is disabled, skipping review event.")
+            return
 
         review_result = None
         score = 0
@@ -259,6 +262,9 @@ def handle_github_push_event(
         commits = handler.get_push_commits()
         if not commits:
             logger.error("Failed to get commits")
+            return
+        if not push_review_enabled:
+            logger.info("GitHub push review is disabled, skipping review event.")
             return
 
         review_result = None
