@@ -25,5 +25,6 @@ class ReviewResult:
     risk_level: str = ""
     merge_advice: str = ""
     comments: list[ReviewComment] = field(default_factory=list)
+    input_warnings: list[str] = field(default_factory=list)
     raw_text: str = ""
     parse_error: str = ""

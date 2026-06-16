@@ -3,6 +3,7 @@ import unittest
 from biz.diff.resolver import resolve_line_numbers
 from biz.model.diff import Diff
 from biz.model.review_comment import ReviewComment, ReviewResult
+from biz.utils.code_reviewer import CodeReviewer
 from biz.utils.review_renderer import render_review_markdown
 from biz.utils.review_result_parser import parse_review_result
 
@@ -87,6 +88,22 @@ trailing text { "ignored": true }
 
         self.assertFalse(result.parse_error)
         self.assertEqual(result.summary, "Nested content")
+
+    def test_parse_review_result_ignores_model_provided_input_warnings(self):
+        result = parse_review_result(
+            """
+{
+  "summary": "One issue found",
+  "score": 80,
+  "risk_level": "medium",
+  "merge_advice": "fix and merge",
+  "input_warnings": ["model supplied warning"],
+  "comments": []
+}
+"""
+        )
+
+        self.assertEqual(result.input_warnings, [])
 
     def test_resolve_added_line_from_new_side(self):
         comments = [
@@ -183,6 +200,40 @@ trailing text { "ignored": true }
         self.assertIn("## Review Conclusion", markdown)
         self.assertIn("Unable to parse structured issue list", markdown)
         self.assertNotEqual(markdown, raw_text)
+
+    def test_high_comment_without_diff_evidence_is_downgraded(self):
+        result = ReviewResult(
+            summary="Found high risk.",
+            risk_level="high",
+            merge_advice="do not merge",
+            comments=[
+                ReviewComment(
+                    path="app.py",
+                    content="This may be a performance issue and needs context confirmation.",
+                    existing_code="not in diff",
+                    severity="high",
+                    category="performance",
+                    resolve_reason="existing_code not found in diff",
+                )
+            ],
+        )
+
+        CodeReviewer.apply_quality_gate(result)
+
+        self.assertEqual(result.comments[0].severity, "medium")
+        self.assertEqual(result.risk_level, "medium")
+
+    def test_renderer_outputs_input_warnings(self):
+        result = ReviewResult(
+            summary="No specific issues found.",
+            risk_level="low",
+            input_warnings=["Diff truncated due to token budget limit."],
+        )
+
+        markdown = render_review_markdown(result)
+
+        self.assertIn("## Input Completeness", markdown)
+        self.assertIn("Diff truncated due to token budget limit.", markdown)
 
 
 if __name__ == "__main__":

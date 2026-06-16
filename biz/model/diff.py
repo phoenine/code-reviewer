@@ -12,6 +12,7 @@ class Diff:
     is_deleted: bool = False
     is_binary: bool = False
     source: str = ""
+    warnings: list[str] = field(default_factory=list)
     raw: dict = field(default_factory=dict)
 
     @property

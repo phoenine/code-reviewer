@@ -127,41 +127,59 @@ class PullRequestHandler:
                 "Authorization": f"token {self.github_token}",
                 "Accept": "application/vnd.github.v3+json",
             }
-            response = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT_SECONDS)
-            logger.debug(
-                f"Get changes response from GitHub (attempt {attempt + 1}): {response.status_code}, {response.text}, URL: {url}"
-            )
-
-            if response.status_code == 200:
-                files = response.json()
-                if files:
-                    changes = []
-                    for file in files:
-                        change = {
-                            "old_path": file.get("filename"),
-                            "new_path": file.get("filename"),
-                            "diff": file.get("patch", ""),
-                            "filename": file.get("filename"),
-                            "previous_filename": file.get("previous_filename"),
-                            "patch": file.get("patch", ""),
-                            "status": file.get("status", ""),
-                            "sha": file.get("sha", ""),
-                            "additions": file.get("additions", 0),
-                            "deletions": file.get("deletions", 0),
-                        }
-                        changes.append(change)
-                    return changes
-                else:
-                    logger.info(
-                        f"Changes is empty, retrying in {retry_delay} seconds... "
-                        f"(attempt {attempt + 1}/{max_retries}), URL: {url}"
-                    )
-                    time.sleep(retry_delay)
-            else:
-                logger.warning(
-                    f"Failed to get changes from GitHub (URL: {url}): {response.status_code}, {response.text}"
+            files = []
+            page = 1
+            while True:
+                response = requests.get(
+                    url,
+                    headers=headers,
+                    params={"per_page": 100, "page": page},
+                    timeout=HTTP_TIMEOUT_SECONDS,
                 )
-                return []
+                logger.debug(
+                    f"Get changes response from GitHub (attempt {attempt + 1}, page {page}): "
+                    f"{response.status_code}, {response.text}, URL: {url}"
+                )
+
+                if response.status_code != 200:
+                    logger.warning(
+                        f"Failed to get changes from GitHub (URL: {url}): "
+                        f"{response.status_code}, {response.text}"
+                    )
+                    return []
+
+                page_files = response.json()
+                if not page_files:
+                    break
+                files.extend(page_files)
+                if len(page_files) < 100:
+                    break
+                page += 1
+
+            if not files:
+                logger.info(
+                    f"Changes is empty, retrying in {retry_delay} seconds... "
+                    f"(attempt {attempt + 1}/{max_retries}), URL: {url}"
+                )
+                time.sleep(retry_delay)
+                continue
+
+            changes = []
+            for file in files:
+                change = {
+                    "old_path": file.get("filename"),
+                    "new_path": file.get("filename"),
+                    "diff": file.get("patch", ""),
+                    "filename": file.get("filename"),
+                    "previous_filename": file.get("previous_filename"),
+                    "patch": file.get("patch", ""),
+                    "status": file.get("status", ""),
+                    "sha": file.get("sha", ""),
+                    "additions": file.get("additions", 0),
+                    "deletions": file.get("deletions", 0),
+                }
+                changes.append(change)
+            return changes
 
         logger.warning(f"Max retries ({max_retries}) reached. Changes is still empty.")
         return []
@@ -379,6 +397,11 @@ class PushHandler:
 
         if response.status_code == 200:
             files = response.json().get("files", [])
+            warnings = []
+            if len(files) >= 300:
+                warnings.append(
+                    "GitHub compare API returned 300 files; the file list may be capped."
+                )
             diffs = []
             for file in files:
                 diff = {
@@ -389,6 +412,8 @@ class PushHandler:
                     "additions": file.get("additions", 0),
                     "deletions": file.get("deletions", 0),
                 }
+                if warnings:
+                    diff["warnings"] = warnings
                 diffs.append(diff)
             return diffs
         else:

@@ -1,7 +1,18 @@
 import unittest
 from unittest.mock import patch
 
+from biz.model.diff import Diff
 from biz.utils.code_reviewer import BaseReviewer, CodeReviewer
+
+
+class RecordingReviewer(CodeReviewer):
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def review_code(self, diffs_text: str, commits_text: str = "") -> str:
+        self.calls.append(diffs_text)
+        return self.responses.pop(0)
 
 
 class CodeReviewerTest(unittest.TestCase):
@@ -72,6 +83,86 @@ class CodeReviewerTest(unittest.TestCase):
         )
         self.assertEqual(BaseReviewer._normalize_review_style("strict"), "strict")
         self.assertEqual(BaseReviewer._normalize_review_style("sarcastic"), "sarcastic")
+
+    def test_split_diffs_for_review_keeps_each_oversized_file_as_own_batch(self):
+        diffs = [
+            Diff(old_path="a.py", new_path="a.py", diff="@@ -1 +1 @@\n-a\n+b"),
+            Diff(old_path="b.py", new_path="b.py", diff="@@ -1 +1 @@\n-c\n+d"),
+        ]
+
+        batches = CodeReviewer.split_diffs_for_review(diffs, max_tokens=1)
+
+        self.assertEqual(
+            [[diff.path for diff in batch] for batch in batches],
+            [["a.py"], ["b.py"]],
+        )
+
+    def test_review_diffs_splits_batches_and_merges_unique_comments(self):
+        diffs = [
+            Diff(old_path="a.py", new_path="a.py", diff="@@ -1 +1 @@\n-old\n+new"),
+            Diff(old_path="b.py", new_path="b.py", diff="@@ -1 +1 @@\n-old\n+new"),
+        ]
+        reviewer = RecordingReviewer(
+            [
+                """{
+                  "summary": "batch one",
+                  "score": 80,
+                  "risk_level": "medium",
+                  "merge_advice": "fix and merge",
+                  "comments": [
+                    {
+                      "path": "a.py",
+                      "severity": "medium",
+                      "category": "correctness",
+                      "content": "a issue",
+                      "existing_code": "new"
+                    }
+                  ]
+                }""",
+                """{
+                  "summary": "batch two",
+                  "score": 90,
+                  "risk_level": "low",
+                  "merge_advice": "approved",
+                  "comments": [
+                    {
+                      "path": "a.py",
+                      "severity": "medium",
+                      "category": "correctness",
+                      "content": "a issue",
+                      "existing_code": "new"
+                    },
+                    {
+                      "path": "b.py",
+                      "severity": "low",
+                      "category": "test",
+                      "content": "b issue",
+                      "existing_code": "new"
+                    }
+                  ]
+                }""",
+            ]
+        )
+
+        with patch.dict(
+            "os.environ",
+            {"REVIEW_MAX_TOKENS": "1000", "REVIEW_CHUNK_MAX_TOKENS": "1"},
+        ):
+            result = reviewer.review_diffs(diffs)
+
+        self.assertEqual(len(reviewer.calls), 2)
+        self.assertEqual([comment.path for comment in result.comments], ["a.py", "b.py"])
+        self.assertEqual(result.score, 85)
+        self.assertEqual(result.risk_level, "medium")
+        self.assertIn("Changes were reviewed in 2 batches.", result.input_warnings)
+        self.assertIn(
+            "Review input contains 2 files, 0 additions, 0 deletions.",
+            result.input_warnings,
+        )
+        self.assertNotIn(
+            "Review input contains 1 files, 0 additions, 0 deletions.",
+            result.input_warnings,
+        )
 
 
 if __name__ == "__main__":

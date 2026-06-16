@@ -71,8 +71,13 @@ def render_review_markdown(result: ReviewResult) -> str:
         "",
         result.summary or "No specific issues found.",
         "",
-        "## Key Issues",
     ]
+    if result.input_warnings:
+        lines.append("## Input Completeness")
+        lines.extend(f"- {warning}" for warning in result.input_warnings)
+        lines.append("")
+
+    lines.append("## Key Issues")
 
     if result.comments:
         for index, comment in enumerate(result.comments, start=1):

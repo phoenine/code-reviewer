@@ -195,6 +195,20 @@ class ReviewContextTest(unittest.TestCase):
             "Supplementary context omitted due to token budget limit", rendered
         )
 
+    def test_collect_review_input_warnings_reports_missing_context_coverage(self):
+        diff = Diff(
+            old_path="app.py",
+            new_path="app.py",
+            diff="@@ -1 +1 @@\n-old\n+new",
+        )
+
+        warnings = CodeReviewer.collect_review_input_warnings("", [diff], None)
+
+        self.assertIn(
+            "Supplementary context was extracted for 0/1 changed files.",
+            warnings,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
