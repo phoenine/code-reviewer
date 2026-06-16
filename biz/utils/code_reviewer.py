@@ -27,6 +27,24 @@ ALLOWED_REVIEW_STYLES = {
     "gentle",
     "humorous",
 }
+VALID_SEVERITIES = {"high", "medium", "low", "info"}
+UNCERTAIN_REVIEW_PHRASES = (
+    "需要结合上下文确认",
+    "需要确认",
+    "建议确认",
+    "无法判断",
+    "证据不足",
+    "可能",
+    "疑似",
+    "may",
+    "might",
+    "possibly",
+    "unclear",
+    "needs context confirmation",
+    "need context confirmation",
+    "requires confirmation",
+)
+INPUT_SUMMARY_WARNING_PREFIX = "Review input contains "
 
 
 class BaseReviewer(abc.ABC):
@@ -249,6 +267,43 @@ class CodeReviewer(BaseReviewer):
         return "\n".join(sections)
 
     @classmethod
+    def _context_for_diffs(
+        cls, review_context: ReviewContext | None, diffs: list[Diff]
+    ) -> ReviewContext | None:
+        if not review_context or not review_context.files:
+            return review_context
+        paths = {diff.path for diff in diffs}
+        return ReviewContext(
+            files=[
+                file_context
+                for file_context in review_context.files
+                if file_context.path in paths
+            ]
+        )
+
+    @classmethod
+    def split_diffs_for_review(cls, diffs: list[Diff], max_tokens: int) -> list[list[Diff]]:
+        if not diffs:
+            return []
+        max_tokens = max(max_tokens, 1)
+        batches: list[list[Diff]] = []
+        current: list[Diff] = []
+        current_tokens = 0
+
+        for diff in diffs:
+            diff_tokens = count_tokens(cls.render_diffs_for_prompt([diff]))
+            if current and current_tokens + diff_tokens > max_tokens:
+                batches.append(current)
+                current = []
+                current_tokens = 0
+            current.append(diff)
+            current_tokens += diff_tokens
+
+        if current:
+            batches.append(current)
+        return batches
+
+    @classmethod
     def render_review_input_with_budget(
         cls,
         diffs: list[Diff],
@@ -332,6 +387,129 @@ class CodeReviewer(BaseReviewer):
             )
         return review_input
 
+    @staticmethod
+    def collect_review_input_warnings(
+        review_input: str,
+        diffs: list[Diff],
+        review_context: ReviewContext | None,
+    ) -> list[str]:
+        warnings: list[str] = [
+            "Review input contains "
+            f"{len(diffs)} files, {sum(diff.additions for diff in diffs)} additions, "
+            f"{sum(diff.deletions for diff in diffs)} deletions."
+        ]
+        for diff in diffs:
+            for warning in diff.warnings:
+                warnings.append(f"{diff.path}: {warning}")
+
+        if "Diff truncated due to token budget limit" in review_input:
+            warnings.append("Diff truncated due to token budget limit.")
+        if "Supplementary context omitted due to token budget limit" in review_input:
+            warnings.append("Supplementary context omitted due to token budget limit.")
+        if "Supplementary context truncated due to token budget limit" in review_input:
+            warnings.append("Supplementary context truncated due to token budget limit.")
+
+        if diffs and (not review_context or not review_context.files):
+            warnings.append(
+                f"Supplementary context was extracted for 0/{len(diffs)} changed files."
+            )
+        elif review_context and review_context.files:
+            for file_context in review_context.files:
+                if file_context.error:
+                    warnings.append(
+                        f"{file_context.path} context read failed: {file_context.error}"
+                    )
+            if len(review_context.files) < len(diffs):
+                warnings.append(
+                    f"Supplementary context was extracted for {len(review_context.files)}/{len(diffs)} changed files."
+                )
+        return list(dict.fromkeys(warnings))
+
+    @staticmethod
+    def _is_input_summary_warning(warning: str) -> bool:
+        return warning.startswith(INPUT_SUMMARY_WARNING_PREFIX)
+
+    @staticmethod
+    def _is_uncertain_comment(content: str) -> bool:
+        normalized = content.lower()
+        return any(phrase in normalized for phrase in UNCERTAIN_REVIEW_PHRASES)
+
+    @staticmethod
+    def _risk_label(level: str, english: str, chinese: str) -> bool:
+        return level.strip().lower() == english or level.strip() == chinese
+
+    @classmethod
+    def apply_quality_gate(cls, result: ReviewResult) -> ReviewResult:
+        for comment in result.comments:
+            if comment.severity not in VALID_SEVERITIES:
+                comment.severity = "medium"
+            if comment.severity != "high":
+                continue
+            if not comment.line_resolved or cls._is_uncertain_comment(comment.content):
+                comment.severity = "medium"
+
+        if cls._risk_label(result.risk_level, "high", "高") and not any(
+            comment.severity == "high" for comment in result.comments
+        ):
+            use_chinese = result.risk_level.strip() == "高"
+            if any(comment.severity == "medium" for comment in result.comments):
+                result.risk_level = "中" if use_chinese else "medium"
+            else:
+                result.risk_level = "低" if use_chinese else "low"
+        return result
+
+    @classmethod
+    def merge_review_results(cls, results: list[ReviewResult]) -> ReviewResult:
+        if not results:
+            return ReviewResult(summary="Code is empty", raw_text="")
+
+        comments = []
+        seen_comments = set()
+        for result in results:
+            for comment in result.comments:
+                key = (
+                    comment.path,
+                    comment.existing_code.strip(),
+                    comment.category,
+                    comment.content.strip(),
+                )
+                if key in seen_comments:
+                    continue
+                seen_comments.add(key)
+                comments.append(comment)
+
+        scores = [result.score for result in results if result.score is not None]
+        input_warnings = list(
+            dict.fromkeys(
+                warning
+                for result in results
+                for warning in result.input_warnings
+                if warning
+            )
+        )
+        summaries = [
+            result.summary.strip()
+            for result in results
+            if result.summary and result.summary.strip()
+        ]
+        merged = ReviewResult(
+            summary="; ".join(dict.fromkeys(summaries)) or "No specific issues found.",
+            score=round(sum(scores) / len(scores)) if scores else None,
+            comments=comments,
+            input_warnings=input_warnings,
+            raw_text="\n\n".join(result.raw_text for result in results if result.raw_text),
+        )
+        if any(comment.severity == "high" for comment in comments):
+            merged.risk_level = "high"
+            merged.merge_advice = "do not merge"
+        elif any(comment.severity == "medium" for comment in comments):
+            merged.risk_level = "medium"
+            merged.merge_advice = "fix and merge"
+        else:
+            merged.risk_level = "low"
+            merged.merge_advice = "approved"
+        return merged
+
     def review_and_strip_code(self, changes_text: str, commits_text: str = "") -> str:
         """
         Review and determine if changes_text exceeds REVIEW_MAX_TOKENS tokens,
@@ -353,17 +531,21 @@ class CodeReviewer(BaseReviewer):
             return review_result[11:-3].strip()
         return review_result
 
-    def review_diffs(
+    def _review_diffs_once(
         self,
         diffs: list[Diff],
         commits_text: str = "",
         review_context: ReviewContext | None = None,
+        input_warnings: list[str] | None = None,
     ) -> ReviewResult:
         review_max_tokens = int(os.getenv("REVIEW_MAX_TOKENS", 10000))
         changes_text = self.render_review_input_with_budget(
             diffs,
             review_context,
             review_max_tokens,
+        )
+        system_input_warnings = self.collect_review_input_warnings(
+            changes_text, diffs, review_context
         )
         if not changes_text:
             return ReviewResult(summary="Code is empty", raw_text="")
@@ -374,12 +556,80 @@ class CodeReviewer(BaseReviewer):
 
         raw_result = self.review_code(changes_text, commits_text).strip()
         result = parse_review_result(raw_result)
+        result.input_warnings = list(
+            dict.fromkeys([*(input_warnings or []), *system_input_warnings])
+        )
         if result.parse_error:
             result.score = self.parse_review_score(raw_result)
             return result
 
         result.comments = resolve_line_numbers(result.comments, diffs)
+        self.apply_quality_gate(result)
         return result
+
+    def review_diffs(
+        self,
+        diffs: list[Diff],
+        commits_text: str = "",
+        review_context: ReviewContext | None = None,
+        input_warnings: list[str] | None = None,
+    ) -> ReviewResult:
+        review_max_tokens = int(os.getenv("REVIEW_MAX_TOKENS", 10000))
+        available_tokens = max(
+            review_max_tokens - self._env_int("REVIEW_PROMPT_RESERVED_TOKENS", 1000),
+            1,
+        )
+        default_chunk_tokens = max(
+            int(
+                available_tokens
+                * max(0.0, min(self._env_float("REVIEW_DIFF_TOKEN_RATIO", 0.65), 1.0))
+            ),
+            1,
+        )
+        chunk_max_tokens = self._env_int("REVIEW_CHUNK_MAX_TOKENS", default_chunk_tokens)
+        batches = self.split_diffs_for_review(diffs, chunk_max_tokens)
+        if len(batches) <= 1:
+            return self._review_diffs_once(
+                diffs, commits_text, review_context, input_warnings
+            )
+
+        global_input_warnings = self.collect_review_input_warnings(
+            "", diffs, review_context
+        )
+        batch_warning = f"Changes were reviewed in {len(batches)} batches."
+        results = []
+        for batch in batches:
+            result = self._review_diffs_once(
+                batch,
+                commits_text,
+                self._context_for_diffs(review_context, batch),
+            )
+            result.input_warnings = list(
+                dict.fromkeys(
+                    [
+                        batch_warning,
+                        *result.input_warnings,
+                    ]
+                )
+            )
+            results.append(result)
+        merged = self.merge_review_results(results)
+        merged.input_warnings = list(
+            dict.fromkeys(
+                [
+                    batch_warning,
+                    *(input_warnings or []),
+                    *global_input_warnings,
+                    *[
+                        warning
+                        for warning in merged.input_warnings
+                        if warning != batch_warning
+                        and not self._is_input_summary_warning(warning)
+                    ],
+                ]
+            )
+        )
+        return merged
 
     def review_code(self, diffs_text: str, commits_text: str = "") -> str:
         """Review code and return the result"""

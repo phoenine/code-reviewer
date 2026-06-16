@@ -3,6 +3,8 @@ import base64
 from unittest.mock import Mock, patch
 
 from biz.platforms.github.webhook_handler import (
+    PullRequestHandler,
+    PushHandler,
     _get_repository_file_content as get_github_file_content,
 )
 
@@ -81,6 +83,90 @@ class PlatformFileContentTest(unittest.TestCase):
         )
 
         self.assertEqual(content, "hello")
+
+    @patch("biz.platforms.github.webhook_handler.requests.get")
+    def test_github_pull_request_changes_fetches_all_pages(self, mock_get):
+        first = Mock()
+        first.status_code = 200
+        first.json.return_value = [
+            {
+                "filename": f"a{idx}.py",
+                "patch": "@@ -1 +1 @@\n-a\n+b",
+                "additions": 1,
+                "deletions": 1,
+            }
+            for idx in range(100)
+        ]
+        second = Mock()
+        second.status_code = 200
+        second.json.return_value = [
+            {
+                "filename": "b.py",
+                "patch": "@@ -1 +1 @@\n-c\n+d",
+                "additions": 1,
+                "deletions": 1,
+            }
+        ]
+        mock_get.side_effect = [first, second]
+        handler = PullRequestHandler(
+            {
+                "action": "synchronize",
+                "pull_request": {"number": 12},
+                "repository": {"full_name": "owner/repo"},
+            },
+            "token",
+            "https://github.com",
+        )
+
+        changes = handler.get_pull_request_changes()
+
+        self.assertEqual(len(changes), 101)
+        self.assertEqual(changes[0]["filename"], "a0.py")
+        self.assertEqual(changes[-1]["filename"], "b.py")
+        self.assertEqual(
+            mock_get.call_args_list[0].kwargs["params"],
+            {"per_page": 100, "page": 1},
+        )
+        self.assertEqual(
+            mock_get.call_args_list[1].kwargs["params"],
+            {"per_page": 100, "page": 2},
+        )
+
+    @patch("biz.platforms.github.webhook_handler.requests.get")
+    def test_github_compare_marks_large_file_list_as_incomplete(self, mock_get):
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {
+            "files": [
+                {
+                    "filename": f"file{idx}.py",
+                    "patch": "@@ -1 +1 @@\n-a\n+b",
+                    "status": "modified",
+                    "additions": 1,
+                    "deletions": 1,
+                }
+                for idx in range(300)
+            ]
+        }
+        mock_get.return_value = response
+        handler = PushHandler(
+            {
+                "ref": "refs/heads/dev",
+                "repository": {"full_name": "owner/repo"},
+                "commits": [],
+            },
+            "token",
+            "https://github.com",
+        )
+
+        changes = handler.repository_compare("base", "head")
+
+        self.assertEqual(len(changes), 300)
+        self.assertIn("warnings", changes[0])
+        self.assertIn(
+            "GitHub compare API returned 300 files; the file list may be capped.",
+            changes[0]["warnings"],
+        )
 
 
 if __name__ == "__main__":

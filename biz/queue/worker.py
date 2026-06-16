@@ -5,13 +5,13 @@ from datetime import datetime
 from biz.entity.review_entity import MergeRequestReviewEntity, PushReviewEntity
 from biz.event.event_manager import event_manager
 from biz.context.window import build_review_context
+from biz.diff.filter import DiffFilterResult, filter_diffs_with_stats
+from biz.diff.parser import parse_changes
 from biz.platforms.gitlab.webhook_handler import (
-    filter_changes,
     MergeRequestHandler,
     PushHandler,
 )
 from biz.platforms.github.webhook_handler import (
-    filter_changes as filter_github_changes,
     PullRequestHandler as GithubPullRequestHandler,
     PushHandler as GithubPushHandler,
 )
@@ -39,6 +39,10 @@ def _count_change_stats(changes: list[Diff]) -> tuple[int, int]:
         additions += item.additions
         deletions += item.deletions
     return additions, deletions
+
+
+def _filter_changes_with_stats(changes: list[dict], source: str) -> DiffFilterResult:
+    return filter_diffs_with_stats(parse_changes(changes, source=source))
 
 
 def _gitlab_project_context(webhook_data: dict) -> dict:
@@ -74,9 +78,13 @@ def _review_changes(
     commits: list[dict],
     project_context: dict | None = None,
     review_context: ReviewContext | None = None,
+    input_warnings: list[str] | None = None,
 ) -> tuple[str, int | None]:
     review_result = CodeReviewer(project_context).review_diffs(
-        changes, _build_commits_text(commits), review_context
+        changes,
+        _build_commits_text(commits),
+        review_context,
+        input_warnings=input_warnings,
     )
     return render_review_markdown(review_result), review_result.score
 
@@ -103,7 +111,8 @@ def handle_push_event(
         if push_review_enabled:
             changes = handler.get_push_changes()
             logger.info("changes: %s", changes)
-            changes = filter_changes(changes)
+            filter_result = _filter_changes_with_stats(changes, source="gitlab")
+            changes = filter_result.diffs
             if not changes:
                 logger.info(
                     "No code changes detected in supported file types."
@@ -119,6 +128,7 @@ def handle_push_event(
                     commits,
                     _gitlab_project_context(webhook_data),
                     review_context,
+                    filter_result.to_warnings(),
                 )
                 additions, deletions = _count_change_stats(changes)
             # Post review result as GitLab note
@@ -205,7 +215,8 @@ def handle_merge_request_event(
 
         changes = handler.get_merge_request_changes()
         logger.info("changes: %s", changes)
-        changes = filter_changes(changes)
+        filter_result = _filter_changes_with_stats(changes, source="gitlab")
+        changes = filter_result.diffs
         if not changes:
             logger.info(
                 "No code changes detected in supported file types."
@@ -220,7 +231,11 @@ def handle_merge_request_event(
 
         review_context = _build_context(handler, changes, last_commit_id)
         review_result, score = _review_changes(
-            changes, commits, _gitlab_project_context(webhook_data), review_context
+            changes,
+            commits,
+            _gitlab_project_context(webhook_data),
+            review_context,
+            filter_result.to_warnings(),
         )
 
         handler.add_merge_request_notes(f"Auto Review Result: \n{review_result}")
@@ -274,7 +289,8 @@ def handle_github_push_event(
         if push_review_enabled:
             changes = handler.get_push_changes()
             logger.info("changes: %s", changes)
-            changes = filter_github_changes(changes)
+            filter_result = _filter_changes_with_stats(changes, source="github")
+            changes = filter_result.diffs
             if not changes:
                 logger.info(
                     "No code changes detected in supported file types."
@@ -290,6 +306,7 @@ def handle_github_push_event(
                     commits,
                     _github_project_context(webhook_data),
                     review_context,
+                    filter_result.to_warnings(),
                 )
                 additions, deletions = _count_change_stats(changes)
             handler.add_push_notes(f"Auto Review Result: \n{review_result}")
@@ -358,7 +375,8 @@ def handle_github_pull_request_event(
 
         changes = handler.get_pull_request_changes()
         logger.info("changes: %s", changes)
-        changes = filter_github_changes(changes)
+        filter_result = _filter_changes_with_stats(changes, source="github")
+        changes = filter_result.diffs
         if not changes:
             logger.info(
                 "No code changes detected in supported file types."
@@ -373,7 +391,11 @@ def handle_github_pull_request_event(
 
         review_context = _build_context(handler, changes, github_last_commit_id)
         review_result, score = _review_changes(
-            changes, commits, _github_project_context(webhook_data), review_context
+            changes,
+            commits,
+            _github_project_context(webhook_data),
+            review_context,
+            filter_result.to_warnings(),
         )
 
         handler.add_pull_request_notes(f"Auto Review Result: \n{review_result}")
